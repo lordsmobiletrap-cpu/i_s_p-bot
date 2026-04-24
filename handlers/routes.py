@@ -144,8 +144,6 @@ async def close_db() -> None:
     global _db
     if _db is not None:
         await _db.close()
-
-        
         _db = None
         logger.info("Database connection closed.")
 
