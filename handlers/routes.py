@@ -363,7 +363,10 @@ async def cmd_practice(message: Message, bot: Bot):
     if not sub_active and free_used >= FREE_ATTEMPTS_LIMIT:
         await message.answer(
             "❌ You've used your free trial attempts.\n\n"
-            f"To continue practicing, please subscribe:\n{STRIPE_PAYMENT_LINK}",
+            "To continue practicing, you'll need to purchase our premium plan, which offers lifetime unlimited access for a one-time payment of 5$.\n\n"
+            "This plan will give you unlimited practice sessions, allowing you to improve your speaking skills for the IELTS test.\n\n"
+            f"Click here to purchase: {STRIPE_PAYMENT_LINK}\n\n"
+            "If you have any questions or feedback, please message the creator's personal Telegram account: @dkuzerbay",
             disable_web_page_preview=True
         )
         return
