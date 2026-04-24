@@ -7,7 +7,12 @@ import aiohttp
 import aiosqlite
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import (
+        CallbackQuery, 
+        Message,
+        InlineKeyboardMarkup, 
+        InlineKeyboardButton
+    )
 from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
@@ -30,6 +35,67 @@ REMINDER_TEXT = (
     "You received a topic — now it's time to speak. "
     "Record your answer and send it here as a voice message. We'll give you detailed feedback right away!"
 )
+
+
+# ----------  Admin helpers  ----------
+
+# Загружаем ID администраторов из переменной окружения
+_ADMIN_IDS_RAW = getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(x.strip()) for x in _ADMIN_IDS_RAW.split(",") if x.strip().isdigit()]
+
+# Обработчик для поиска пользователя по ID (ожидание текста)
+_admin_waiting_for_user_id = {}
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+async def get_all_users(limit: int = 20, offset: int = 0) -> list[dict]:
+    """Возвращает список пользователей с пагинацией."""
+    db = get_db()
+    async with db.execute(
+        "SELECT user_id, free_attempts_used, subscription_active, created_at FROM users ORDER BY user_id LIMIT ? OFFSET ?",
+        (limit, offset)
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return [
+        {
+            "user_id": row[0],
+            "free_attempts_used": row[1],
+            "subscription_active": bool(row[2]),
+            "created_at": row[3],
+        }
+        for row in rows
+    ]
+
+async def get_user_by_id(user_id: int) -> dict | None:
+    db = get_db()
+    async with db.execute(
+        "SELECT user_id, free_attempts_used, subscription_active, created_at FROM users WHERE user_id = ?",
+        (user_id,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "user_id": row[0],
+        "free_attempts_used": row[1],
+        "subscription_active": bool(row[2]),
+        "created_at": row[3],
+    }
+
+async def update_subscription(user_id: int, active: bool) -> bool:
+    """Устанавливает subscription_active = active. Возвращает True, если запись обновлена."""
+    db = get_db()
+    await db.execute(
+        "UPDATE users SET subscription_active = ? WHERE user_id = ?",
+        (1 if active else 0, user_id)
+    )
+    await db.commit()
+    # Проверяем, был ли обновлён хотя бы один ряд
+    async with db.execute("SELECT changes()") as cur:
+        changed = await cur.fetchone()
+    return changed[0] > 0
+
 
 
 # ----------  Database  ----------
@@ -358,6 +424,203 @@ async def process_audio(message: Message, bot: Bot):
 
 
 # ----------  Lifecycle  ----------
+
+# ----------  Admin handlers  ----------
+
+# def admin_only(handler):
+#     """Декоратор для проверки прав администратора."""
+#     async def wrapper(message: Message, *args, **kwargs):
+#         if not is_admin(message.from_user.id):
+#             await message.answer("⛔ У вас нет прав для этой команды.")
+#             return
+#         return await handler(message, *args, **kwargs)
+#     return wrapper
+
+@router.message(Command("admin"))
+# @admin_only
+async def admin_panel(message: Message):
+    logger.info(f"Admin check: user_id={message.from_user.id}, ADMIN_IDS={ADMIN_IDS}")
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет прав для этой команды.")
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Список пользователей", callback_data="admin_list_users")],
+        [InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="admin_find_user")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+    ])
+    await message.answer("👑 Админ-панель\nВыберите действие:", reply_markup=keyboard)
+
+@router.callback_query(lambda c: c.data == "admin_back")
+async def admin_back(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён")
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Список пользователей", callback_data="admin_list_users")],
+        [InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="admin_find_user")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+    ])
+    await callback.message.edit_text("👑 Админ-панель\nВыберите действие:", reply_markup=keyboard)
+    await callback.answer()
+
+@router.callback_query(lambda c: c.data == "admin_switch_instruction")
+async def admin_switch_instruction(callback: CallbackQuery):
+    await callback.answer("Нажмите кнопку 'Переключить' рядом с нужным пользователем", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data.startswith("admin_"))
+async def admin_callback_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Доступ запрещён", show_alert=True)
+        await callback.message.delete()
+        return
+
+    data = callback.data
+    if data == "admin_list_users":
+        # Показываем пользователей с пагинацией (страницы по 5)
+        await show_users_page(callback, offset=0)
+    elif data == "admin_find_user":
+        await callback.message.answer("Введите ID пользователя в цифрах:")
+        # Сохраняем состояние, что ожидаем ввод ID
+        # Проще: следующий хендлер на текстовые сообщения с флагом
+        # Можно использовать FSM, но для простоты — глобальный dict ожиданий
+        # Реализуем через простую временную переменную в кэше (например, словарь)
+        _admin_waiting_for_user_id[callback.message.chat.id] = True
+        await callback.answer()
+    elif data == "admin_stats":
+        await show_admin_stats(callback)
+    elif data.startswith("admin_page_"):
+        # Формат: admin_page_<offset>
+        offset = int(data.split("_")[2])
+        await show_users_page(callback, offset)
+    elif data.startswith("admin_toggle_"):
+        # Формат: admin_toggle_<user_id>
+        uid = int(data.split("_")[2])
+        # Получаем текущий статус
+        user = await get_user_by_id(uid)
+        if user:
+            new_status = not user["subscription_active"]
+            await update_subscription(uid, new_status)
+            await callback.answer(f"Подписка для {uid} изменена: {'активна' if new_status else 'неактивна'}")
+            # Обновляем сообщение со списком пользователей, если оно было показано
+            # Просто возвращаемся к списку с тем же offset, что был (нужно сохранить offset)
+            # Для простоты отправим свежий список с offset=0
+            await show_users_page(callback, offset=0)
+        else:
+            await callback.answer("Пользователь не найден", show_alert=True)
+    else:
+        await callback.answer("Неизвестная команда")
+
+# Пагинация: показываем пользователей
+async def show_users_page(callback: CallbackQuery, offset: int):
+    users = await get_all_users(limit=5, offset=offset)
+    if not users:
+        text = "📭 Пользователи не найдены."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад в админку", callback_data="admin_back")]
+        ])
+        await callback.message.edit_text(text, reply_markup=kb)
+        return
+
+    text = "👥 *Список пользователей:*\n\n"
+    for u in users:
+        status = "✅ Активна" if u["subscription_active"] else "❌ Неактивна"
+        text += f"🆔 `{u['user_id']}`\n"
+        text += f"   Попыток: {u['free_attempts_used']}\n"
+        text += f"   Подписка: {status}\n"
+        text += f"   Регистрация: {u['created_at']}\n"
+        text += "   ➖➖➖➖\n"
+
+    # Кнопки пагинации
+    nav_buttons = []
+    if offset > 0:
+        nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin_page_{offset-5}"))
+    # Проверяем, есть ли ещё пользователи (запросили limit+1)
+    next_offset = offset + 5
+    next_users = await get_all_users(limit=1, offset=next_offset)
+    if next_users:
+        nav_buttons.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"admin_page_{next_offset}"))
+    # Кнопка "Обновить" (просто перезагрузить текущую страницу)
+    nav_buttons.append(InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin_page_{offset}"))
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        nav_buttons,
+        [InlineKeyboardButton(text="🏠 В админку", callback_data="admin_back")],
+        [InlineKeyboardButton(text="✏️ Переключить подписку", callback_data="admin_switch_instruction")]
+    ])
+    # Также добавим кнопки для каждого пользователя для быстрого переключения
+    # Чтобы не перегружать, можно добавить отдельную кнопку "Переключить" возле каждого пользователя в будущем
+    # Сделаем отдельные кнопки для каждого пользователя (inline под каждым пользователем)
+    # Для этого перестроим клавиатуру: сначала пользователи, потом пагинация
+    user_buttons = []
+    for u in users:
+        btn_text = f"🔄 Переключить {u['user_id']}"
+        user_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"admin_toggle_{u['user_id']}")])
+    if user_buttons:
+        keyboard.inline_keyboard = user_buttons + keyboard.inline_keyboard
+
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+async def show_admin_stats(callback: CallbackQuery):
+    db = get_db()
+    async with db.execute("SELECT COUNT(*) FROM users") as cur:
+        total_users = (await cur.fetchone())[0]
+    async with db.execute("SELECT COUNT(*) FROM users WHERE subscription_active = 1") as cur:
+        active_subs = (await cur.fetchone())[0]
+    async with db.execute("SELECT SUM(free_attempts_used) FROM users") as cur:
+        total_attempts = (await cur.fetchone())[0] or 0
+
+    text = (
+        f"📊 *Статистика бота*\n\n"
+        f"👥 Всего пользователей: {total_users}\n"
+        f"💳 Активных подписок: {active_subs}\n"
+        f"🎙️ Всего использовано попыток: {total_attempts}\n"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
+    ])
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+@router.message(F.text & ~F.command)
+async def handle_admin_find_user(message: Message):
+    chat_id = message.chat.id
+    if not _admin_waiting_for_user_id.get(chat_id, False):
+        return
+    # Проверяем админа
+    if not is_admin(message.from_user.id):
+        return
+    # Пытаемся распарсить ID
+    try:
+        uid = int(message.text.strip())
+    except ValueError:
+        await message.answer("Некорректный ID. Введите число.")
+        return
+
+    user = await get_user_by_id(uid)
+    if not user:
+        await message.answer(f"❌ Пользователь с ID {uid} не найден.")
+    else:
+        status = "✅ активна" if user["subscription_active"] else "❌ неактивна"
+        text = (
+            f"🆔 ID: `{user['user_id']}`\n"
+            f"🎫 Попыток: {user['free_attempts_used']}\n"
+            f"💳 Подписка: {status}\n"
+            f"📅 Регистрация: {user['created_at']}\n"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Переключить подписку", callback_data=f"admin_toggle_{uid}")],
+            [InlineKeyboardButton(text="◀️ Назад в админку", callback_data="admin_back")]
+        ])
+        await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+    # Сбрасываем ожидание
+    _admin_waiting_for_user_id.pop(chat_id, None)
+
+
+
+
+
 
 async def on_startup() -> None:
     await init_db()
