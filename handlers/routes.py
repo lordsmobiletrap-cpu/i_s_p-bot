@@ -297,7 +297,7 @@ Response format strictly as follows:
             {"role": "system", "content": prompt},
             {"role": "user", "content": text}
         ],
-        temperature=0.7
+        temperature=0.2
     )
     content = response.choices[0].message.content
     if not content:
